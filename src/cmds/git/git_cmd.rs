@@ -15,7 +15,9 @@ use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
 use crate::core::user_dirs;
 use crate::core::user_env;
-use crate::core::utils::{exit_code_from_status, join_with_overflow, resolved_command, strip_ansi};
+use crate::core::utils::{
+    decode_process_output, exit_code_from_status, join_with_overflow, resolved_command, strip_ansi,
+};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
@@ -1049,7 +1051,7 @@ fn emit_raw_bytes_passthrough(
     let mut handle = stdout.lock();
     handle
         .write_all(bytes)
-        .context("Failed to write blob to stdout")?;
+        .context("Failed to write git output to stdout")?;
     timer.track_passthrough(label, rtk_label);
     Ok(exit_code)
 }
@@ -3286,7 +3288,10 @@ fn format_status_inner(porcelain: &str, detached: Option<&str>) -> String {
     if let Some(branch_line) = lines.first() {
         if branch_line.starts_with("##") {
             let branch = branch_line.trim_start_matches("## ");
-            let display = detached.unwrap_or(branch);
+            let display = match branch {
+                "HEAD (no branch)" => detached.unwrap_or(branch),
+                _ => branch,
+            };
             output.push(format!("* {}", display));
         } else {
             output.push((*branch_line).to_string());
@@ -3398,35 +3403,37 @@ fn extract_state_header(raw: &str) -> Option<String> {
 /// misread as a branch literally named `HEAD`. Extracts the explicit
 /// `HEAD detached at/from <ref>` line from plain `git status` output instead. `None` if HEAD
 /// is on a branch.
-fn extract_detached_head(raw: &str) -> Option<String> {
+fn extract_detached_head(raw: &str) -> Option<&str> {
     raw.lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("HEAD detached "))
-        .map(str::to_string)
+        .next()
+        .filter(|line| line.starts_with("HEAD detached "))
 }
 
 /// Minimal filtering for git status with user-provided args
 fn filter_status_with_args(output: &str) -> String {
     let mut result = Vec::new();
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-
-        // Skip empty lines
-        if trimmed.is_empty() {
-            continue;
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        // A verbose status ends in a patch whose context lines can also spell advice.
+        if line.starts_with("diff --") {
+            result.push(line);
+            result.extend(lines);
+            break;
         }
-
-        // Skip git hints - can appear at start or within line
-        if trimmed.starts_with("(use \"git")
-            || trimmed.starts_with("(create/copy files")
-            || trimmed.contains("(use \"git add")
-            || trimmed.contains("(use \"git restore")
+        // Git indents advice with two spaces and long-format paths with a tab.
+        if line.is_empty()
+            || line.starts_with("  (use \"git ")
+            || line.starts_with("  (create/copy files ")
+            || matches!(
+                line,
+                "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
+                    | "nothing added to commit but untracked files present (use \"git add\" to track)"
+            )
         {
             continue;
         }
-
-        result.push(line.to_string());
+        result.push(line);
     }
 
     if result.is_empty() {
@@ -3444,36 +3451,34 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     // More complex explicit args still use the existing minimal-filter path.
     if !uses_compact_status_path(args) {
         let mut cmd = build_status_command(args, global_args);
-        let result = exec_capture(&mut cmd).context("Failed to run git status")?;
+        let result = stream::exec_capture_bytes(&mut cmd).context("Failed to run git status")?;
 
-        if !result.success() {
-            if !result.stderr.trim().is_empty() {
-                eprint!("{}", result.stderr);
-            }
-            timer.track(
+        if verbose > 0 || !result.stderr.is_empty() {
+            eprint!("{}", decode_process_output(&result.stderr));
+        }
+        // NUL-delimited status carries unquoted, arbitrary path bytes. Let git's
+        // actual output select this path, including clustered flags and their negations.
+        if result.stdout.contains(&0) {
+            return emit_raw_bytes_passthrough(
+                &result.stdout,
                 &tracked,
-                &format!("rtk {tracked}"),
-                &result.stdout,
-                &result.stdout,
+                &tracking::passthrough_label(&tracked),
+                &timer,
+                result.exit_code,
             );
+        }
+
+        let stdout = decode_process_output(&result.stdout);
+        if !result.success() {
+            timer.track(&tracked, &format!("rtk {tracked}"), &stdout, &stdout);
             return Ok(result.exit_code);
         }
 
-        if verbose > 0 || !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
-        }
+        let filtered = filter_status_with_args(&stdout);
+        let shown = never_worse(&stdout, &filtered);
+        print!("{shown}");
 
-        // Apply minimal filtering: strip ANSI, remove hints, empty lines
-        let filtered = filter_status_with_args(&result.stdout);
-        let filtered = never_worse(&result.stdout, &filtered).to_string();
-        print!("{}", filtered);
-
-        timer.track(
-            &tracked,
-            &format!("rtk {tracked}"),
-            &result.stdout,
-            &filtered,
-        );
+        timer.track(&tracked, &format!("rtk {tracked}"), &stdout, shown);
 
         return Ok(0);
     }
@@ -3503,7 +3508,7 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     }
 
     let formatted = match extract_detached_head(&raw_output) {
-        Some(detached_ref) => format_status_output_detached(&result.stdout, &detached_ref),
+        Some(detached_ref) => format_status_output_detached(&result.stdout, detached_ref),
         None => format_status_output(&result.stdout),
     };
 
@@ -8485,6 +8490,35 @@ no changes added to commit (use "git add" and/or "git commit -a")
     }
 
     #[test]
+    fn test_status_path_named_like_advice_is_kept() {
+        let raw = concat!(
+            "On branch main\n\nUntracked files:\n",
+            "  (use \"git add <file>...\" to include in what will be committed)\n",
+            "\t(create/copy files/x\n\tzz\n\n",
+            "nothing added to commit but untracked files present (use \"git add\" to track)\n",
+        );
+        assert_eq!(
+            filter_status_with_args(raw),
+            "On branch main\nUntracked files:\n\t(create/copy files/x\n\tzz"
+        );
+    }
+
+    #[test]
+    fn test_verbose_status_keeps_advice_looking_patch_context() {
+        let patch = concat!(
+            "diff --git a/file b/file\n@@ -1,2 +1,2 @@\n",
+            "  (use \"git add\" to track)\n-old\n+new",
+        );
+        let raw = format!(
+            "Changes to be committed:\n  (use \"git restore --staged\" to unstage)\n\tmodified:   file\n\n{patch}\n"
+        );
+        assert_eq!(
+            filter_status_with_args(&raw),
+            format!("Changes to be committed:\n\tmodified:   file\n{patch}")
+        );
+    }
+
+    #[test]
     fn test_filter_status_with_args_keeps_entries_after_clean_phrase_path() {
         // A path may spell git's clean-tree sentence; it must not end the listing.
         let short = "?? \"nothing to commit, working tree clean\"\n?? zz-after.txt\n";
@@ -8967,16 +9001,24 @@ Your stash currently has 1 entry
     #[test]
     fn test_extract_detached_head_returns_line() {
         let raw = "HEAD detached at abc1234\nnothing to commit, working tree clean\n";
-        assert_eq!(
-            extract_detached_head(raw),
-            Some("HEAD detached at abc1234".to_string())
-        );
+        assert_eq!(extract_detached_head(raw), Some("HEAD detached at abc1234"));
     }
 
     #[test]
     fn test_extract_detached_head_on_branch_is_none() {
         let raw = "On branch main\nnothing to commit, working tree clean\n";
         assert!(extract_detached_head(raw).is_none());
+    }
+
+    #[test]
+    fn test_status_path_named_like_detached_head_is_not_a_header() {
+        let raw = "On branch main\n\nUntracked files:\n\tHEAD detached at v9\n";
+        assert_eq!(extract_detached_head(raw), None);
+        // The two status calls can also see different HEADs.
+        assert_eq!(
+            format_status_output_detached("## main\n?? zz\n", "HEAD detached at v9"),
+            "* main\n?? zz"
+        );
     }
 
     #[test]
